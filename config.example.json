@@ -1,0 +1,16 @@
+{
+  "source_jira_url": "https://acme-corp.atlassian.net",
+  "source_project_key": "ACME",
+  "source_board_id": 123,
+  "target_jira_url": "https://mycompany.atlassian.net",
+  "target_jira_user": "jirasync-service@mycompany.com",
+  "target_jira_token": "ATATT3xFfGF0r8X9Y2ZaBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890",
+  "target_project_key": "INT",
+  "target_board_id": 456,
+  "status_mapping": {
+    "To Do": "To Do",
+    "In Progress": "In Progress",
+    "Waiting for Input": "Waiting for Input",
+    "Done": "Done"
+  }
+}
