@@ -12,5 +12,6 @@
     "In Progress": "In Progress",
     "Waiting for Input": "Waiting for Input",
     "Done": "Done"
-  }
+  },
+  "sync_comments": false
 }

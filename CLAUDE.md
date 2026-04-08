@@ -111,6 +111,7 @@ The configuration uses clear `source_` and `target_` prefixes to distinguish bet
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `status_mapping` | object | Optional | Maps source statuses to target statuses |
+| `sync_comments` | boolean | Optional | Enable comment synchronization (default: `false`) |
 
 ### Configuration Evolution
 
@@ -157,6 +158,170 @@ The script automatically detects which format is being used:
 - **Conversion**: Old format is automatically converted to new format at load time
 - **Warning**: Deprecation warning is displayed when old format is detected
 - **Backward compatibility**: Both formats work identically after conversion
+
+## Comment Synchronization
+
+As of v1.2.0, jirasync supports synchronizing comments from source issues to target issues. This is an optional feature controlled by the `sync_comments` configuration field.
+
+### Overview
+
+Comment synchronization preserves important discussion context and decisions when issues are synced between Jira instances. The feature:
+- Syncs comments one-way (source → target, matching the issue sync model)
+- Preserves original author names and timestamps
+- Handles both initial bulk sync and incremental updates
+- Uses tracking markers to prevent duplicate comments
+- Respects dry-run mode for testing
+
+### Configuration
+
+Enable comment sync by adding to your config JSON:
+
+```json
+{
+  "sync_comments": true
+}
+```
+
+**Default**: `false` (backward compatible - existing configs continue to work without changes)
+
+### How It Works
+
+#### Comment Tracking Marker Format
+
+To prevent duplicate comments, jirasync embeds a tracking marker in each synced comment:
+
+```
+[Original comment by John Doe on 2026-03-15T14:30:25.123+0000]
+
+<original comment body>
+
+[synced-from: CLIENT-123:comment-10042]
+```
+
+**Marker format**: `[synced-from: {source_issue_key}:comment-{comment_id}]`
+
+The marker includes:
+- Source issue key (e.g., `CLIENT-123`)
+- Source comment ID (e.g., `10042`)
+
+This allows jirasync to:
+1. Identify which comments have already been synced
+2. Skip duplicate comment creation on subsequent runs
+3. Trace comments back to their source for debugging
+
+#### Initial Bulk Sync
+
+When a target issue is **first created**, jirasync:
+1. Fetches all comments from the source issue
+2. Sorts them chronologically (oldest first)
+3. Creates each comment in the target issue with attribution
+
+#### Incremental Sync
+
+On **subsequent sync runs**, jirasync:
+1. Fetches existing target issue comments
+2. Extracts tracking markers to identify synced comments
+3. Fetches source issue comments
+4. Creates only new comments (those not already synced)
+
+### Implementation Details
+
+#### Functions
+
+- `get_issue_comments()`: Fetches comments from source issue via API
+  - Handles pagination for issues with many comments
+  - Sorts comments chronologically
+  - Returns list of comment dicts with id, author, created, body
+
+- `parse_comment_marker()`: Extracts source issue and comment ID from marker
+  - Uses regex pattern: `\[synced-from:\s*([A-Z]+-\d+):comment-(\d+)\]`
+  - Returns `(issue_key, comment_id)` tuple or `(None, None)`
+
+- `generate_comment_marker()`: Creates tracking marker string
+  - Format: `[synced-from: {issue_key}:comment-{comment_id}]`
+
+- `get_synced_comments()`: Fetches target comments and extracts synced IDs
+  - Returns set of synced comment IDs (strings)
+
+- `is_comment_synced()`: Checks if comment already synced
+  - Returns boolean
+
+- `format_synced_comment()`: Formats comment with attribution and marker
+  - Prepends `[Original comment by {author} on {timestamp}]`
+  - Appends tracking marker
+  - Truncates body if exceeding API limit (32,767 chars)
+
+- `create_comment()`: Posts comment to target issue via API
+  - Respects dry-run mode
+  - Returns success boolean
+
+- `sync_comments_for_issue()`: Orchestrates comment sync for one issue
+  - Checks if comment sync enabled
+  - Fetches source comments and synced IDs
+  - Creates new comments only
+  - Logs summary (synced count, skipped count)
+
+#### API Endpoints
+
+- Fetch comments: `GET /rest/api/3/issue/{issueKey}/comment`
+  - Supports pagination via `startAt` and `maxResults` params
+  - Returns comments with author, created timestamp, body
+
+- Create comment: `POST /rest/api/3/issue/{issueKey}/comment`
+  - Payload: `{"body": "comment text"}`
+  - Returns 201 on success
+
+#### Error Handling
+
+Comment sync failures are **non-fatal**:
+- Comment fetch errors: logged, sync continues with other issues
+- Comment creation errors: logged, sync continues with other comments
+- API rate limits: logged with error message
+- Missing comment data: logged with warning, skipped
+
+This ensures comment sync problems don't block issue synchronization.
+
+### Dry-Run Mode
+
+When `--dry-run` flag is set:
+- Comment fetch still happens (read-only)
+- Comment creation is skipped
+- Actions are logged: `[DRY RUN] Would create comment on ISSUE-123`
+- Summary shows: `Would sync N comments, skip M already-synced`
+
+### Performance Considerations
+
+Comment synchronization adds API calls:
+- 1 API call to fetch source comments per issue
+- 1 API call to fetch target comments per issue (for tracking)
+- N API calls to create comments (where N = new comments)
+
+**Recommendations**:
+- Start with `sync_comments: false` and enable after initial issue sync
+- Use `--days` parameter to limit scope during testing
+- Monitor API usage and rate limits
+- Consider syncing comments only for recent issues if performance is critical
+
+### Troubleshooting
+
+**Comments not appearing**:
+- Verify `sync_comments: true` in config
+- Check service user has comment creation permissions on target board
+- Check logs for API errors
+
+**Duplicate comments**:
+- Marker parsing may have failed
+- Check marker format in existing comments
+- Verify regex pattern matches marker format
+
+**Comments out of order**:
+- Should not happen - comments are sorted by `created` timestamp
+- Check source comment timestamps in API response
+
+**Truncated comments**:
+- Jira API limit is 32,767 characters per comment
+- Look for `[...comment truncated due to length...]` in comment body
+- Check logs for truncation warnings
 
 ## Python Script
 

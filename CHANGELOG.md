@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Comment synchronization**: Sync comments from source issues to target issues
+  - Optional `sync_comments` configuration field (defaults to `false` for backward compatibility)
+  - Initial bulk sync of all comments when creating new target issues
+  - Incremental sync of new comments on subsequent runs
+  - Comment attribution preserves original author name and timestamp
+  - Tracking markers prevent duplicate comment creation
+  - Chronological ordering maintains conversation flow
+  - Graceful error handling ensures comment failures don't break issue sync
+  - Full dry-run mode support for testing
+
 ## [1.0.0] - 2026-03-13
 
 ### Added

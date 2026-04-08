@@ -135,6 +135,10 @@ def load_config(config_file=None):
     if "status_mapping" not in config:
         config["status_mapping"] = {}
 
+    # Ensure sync_comments exists with default value false
+    if "sync_comments" not in config:
+        config["sync_comments"] = False
+
     return config
 
 # === STAP 1: Haal issues op uit themorg ===
@@ -199,8 +203,280 @@ def get_remote_issues(config, auth, headers, days=360):
     return issues
 
 
+# === COMMENT SYNC FUNCTIONS ===
+
+def get_issue_comments(config, auth, headers, issue_key):
+    """Fetch all comments from a source issue via Jira REST API
+
+    Returns:
+        list: List of comment dicts with id, author, created, and body fields
+              Returns empty list if no comments or on error
+    """
+    source_url = config['source_jira_url']
+    comments = []
+    start_at = 0
+    max_results = 50  # API default pagination size
+
+    while True:
+        try:
+            url = f"{source_url}/rest/api/3/issue/{issue_key}/comment"
+            params = {
+                "startAt": start_at,
+                "maxResults": max_results
+            }
+            response = requests.get(url, headers=headers, params=params, auth=auth)
+            response.raise_for_status()
+            data = response.json()
+
+            # Extract comment data
+            for comment in data.get("comments", []):
+                comments.append({
+                    "id": comment["id"],
+                    "author": comment.get("author", {}).get("displayName", "Unknown"),
+                    "created": comment["created"],
+                    "body": comment.get("body", "")
+                })
+
+            # Check if there are more comments to fetch
+            total = data.get("total", 0)
+            if start_at + max_results >= total:
+                break
+            start_at += max_results
+
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️ Error fetching comments for {issue_key}: {e}")
+            break
+        except KeyError as e:
+            print(f"⚠️ Missing data in comment response for {issue_key}: {e}")
+            break
+
+    # Sort by creation timestamp (chronological order)
+    comments.sort(key=lambda c: c["created"])
+
+    return comments
+
+
+def parse_comment_marker(comment_body):
+    """Extract source issue key and comment ID from sync marker
+
+    Args:
+        comment_body: The comment text to parse
+
+    Returns:
+        tuple: (source_issue_key, comment_id) or (None, None) if no marker found
+    """
+    import re
+    # Match pattern: [synced-from: ISSUE-123:comment-456]
+    pattern = r'\[synced-from:\s*([A-Z]+-\d+):comment-(\d+)\]'
+    match = re.search(pattern, comment_body)
+    if match:
+        return (match.group(1), match.group(2))
+    return (None, None)
+
+
+def generate_comment_marker(source_issue_key, comment_id):
+    """Generate a unique tracking marker for a synced comment
+
+    Args:
+        source_issue_key: The source Jira issue key (e.g., "CLIENT-123")
+        comment_id: The source comment ID
+
+    Returns:
+        str: Marker string in format [synced-from: ISSUE-123:comment-456]
+    """
+    return f"[synced-from: {source_issue_key}:comment-{comment_id}]"
+
+
+def get_synced_comments(config, auth, headers, target_issue_key):
+    """Fetch target issue comments and extract synced comment markers
+
+    Args:
+        config: Configuration dict
+        auth: HTTP auth object
+        headers: HTTP headers dict
+        target_issue_key: The target Jira issue key
+
+    Returns:
+        set: Set of synced comment IDs (as strings)
+    """
+    target_url = config['target_jira_url']
+    synced_ids = set()
+    start_at = 0
+    max_results = 50
+
+    while True:
+        try:
+            url = f"{target_url}/rest/api/3/issue/{target_issue_key}/comment"
+            params = {
+                "startAt": start_at,
+                "maxResults": max_results
+            }
+            response = requests.get(url, headers=headers, params=params, auth=auth)
+            response.raise_for_status()
+            data = response.json()
+
+            # Extract markers from comments
+            for comment in data.get("comments", []):
+                body = comment.get("body", "")
+                _, comment_id = parse_comment_marker(body)
+                if comment_id:
+                    synced_ids.add(comment_id)
+
+            # Check if there are more comments
+            total = data.get("total", 0)
+            if start_at + max_results >= total:
+                break
+            start_at += max_results
+
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️ Error fetching synced comments for {target_issue_key}: {e}")
+            break
+        except KeyError as e:
+            print(f"⚠️ Missing data in synced comments response for {target_issue_key}: {e}")
+            break
+
+    return synced_ids
+
+
+def is_comment_synced(comment_id, synced_comment_ids):
+    """Check if a comment has already been synced
+
+    Args:
+        comment_id: The source comment ID to check
+        synced_comment_ids: Set of already-synced comment IDs
+
+    Returns:
+        bool: True if comment is already synced, False otherwise
+    """
+    return str(comment_id) in synced_comment_ids
+
+
+def format_synced_comment(source_issue_key, comment):
+    """Format a comment with attribution and tracking marker
+
+    Args:
+        source_issue_key: The source Jira issue key
+        comment: Dict with author, created, body, and id fields
+
+    Returns:
+        str: Formatted comment body with attribution and marker
+    """
+    author = comment.get("author", "Unknown")
+    timestamp = comment.get("created", "Unknown date")
+    body = comment.get("body", "")
+    comment_id = comment.get("id")
+
+    # Truncate body if it would exceed API limits (32,767 chars)
+    # Account for attribution and marker overhead (~200 chars)
+    max_body_length = 32500
+    if len(body) > max_body_length:
+        body = body[:max_body_length] + "\n\n[...comment truncated due to length...]"
+        print(f"⚠️ Comment {comment_id} truncated (original length: {len(comment.get('body', ''))} chars)")
+
+    marker = generate_comment_marker(source_issue_key, comment_id)
+
+    formatted = f"[Original comment by {author} on {timestamp}]\n\n{body}\n\n{marker}"
+    return formatted
+
+
+def create_comment(config, auth, headers, target_issue_key, comment_body, dry_run=False):
+    """Post a comment to a target issue via Jira REST API
+
+    Args:
+        config: Configuration dict
+        auth: HTTP auth object
+        headers: HTTP headers dict
+        target_issue_key: The target Jira issue key
+        comment_body: The formatted comment text
+        dry_run: If True, only log the action without making API call
+
+    Returns:
+        bool: True if successful (or dry-run), False on error
+    """
+    if dry_run:
+        print(f"  [DRY RUN] Would create comment on {target_issue_key}")
+        return True
+
+    target_url = config['target_jira_url']
+
+    try:
+        url = f"{target_url}/rest/api/3/issue/{target_issue_key}/comment"
+        payload = {
+            "body": comment_body
+        }
+        response = requests.post(url, headers=headers, auth=auth, json=payload)
+        response.raise_for_status()
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️ Error creating comment on {target_issue_key}: {e}")
+        return False
+
+
+def sync_comments_for_issue(config, auth, headers, source_issue_key, target_issue_key, dry_run=False):
+    """Orchestrate comment synchronization for a single issue
+
+    Args:
+        config: Configuration dict
+        auth: HTTP auth object
+        headers: HTTP headers dict
+        source_issue_key: The source Jira issue key
+        target_issue_key: The target Jira issue key
+        dry_run: If True, only log actions without making changes
+
+    Returns:
+        int: Number of comments synced (or would be synced in dry-run)
+    """
+    # Check if comment sync is enabled
+    if not config.get("sync_comments", False):
+        return 0
+
+    print(f"  💬 Syncing comments for {source_issue_key} → {target_issue_key}...")
+
+    # Fetch source comments
+    source_comments = get_issue_comments(config, auth, headers, source_issue_key)
+
+    if not source_comments:
+        print(f"  ℹ️ No comments to sync for {source_issue_key}")
+        return 0
+
+    # Get already-synced comment IDs
+    synced_comment_ids = get_synced_comments(config, auth, headers, target_issue_key)
+
+    # Sync new comments
+    synced_count = 0
+    skipped_count = 0
+
+    for comment in source_comments:
+        comment_id = comment["id"]
+
+        # Check if already synced
+        if is_comment_synced(comment_id, synced_comment_ids):
+            skipped_count += 1
+            continue
+
+        # Format and create comment
+        formatted_body = format_synced_comment(source_issue_key, comment)
+        success = create_comment(config, auth, headers, target_issue_key, formatted_body, dry_run)
+
+        if success:
+            synced_count += 1
+        else:
+            print(f"  ⚠️ Failed to sync comment {comment_id}")
+
+    # Log summary
+    if dry_run:
+        print(f"  [DRY RUN] Would sync {synced_count} comments, skip {skipped_count} already-synced")
+    else:
+        if synced_count > 0:
+            print(f"  ✅ Synced {synced_count} comments, skipped {skipped_count} already-synced")
+        elif skipped_count > 0:
+            print(f"  ℹ️ All {skipped_count} comments already synced")
+
+    return synced_count
+
+
 # === STAP 2: Synchroniseer issues naar lokaal project ===
-def sync_issues_to_local(config, auth, headers, issues):
+def sync_issues_to_local(config, auth, headers, issues, dry_run=False):
     target_url = config['target_jira_url']
     target_project = config['target_project_key']
 
@@ -241,6 +517,9 @@ def sync_issues_to_local(config, auth, headers, issues):
             desired_status = config['status_mapping'].get(remote_status)
             if desired_status and local_status != desired_status:
                 sync_status(config, auth, headers, local_key, desired_status)
+
+            # Sync comments (incremental)
+            sync_comments_for_issue(config, auth, headers, remote_key, local_key, dry_run)
         else:
             # Issue bestaat nog niet, dus aanmaken
             print(f"➕ Aanmaken: nieuw issue voor {remote_key}")
@@ -256,7 +535,11 @@ def sync_issues_to_local(config, auth, headers, issues):
             try:
                 response = requests.post(create_url, headers=headers, auth=auth, json=payload)
                 response.raise_for_status()
-                print(f"✅ Aangemaakt: {response.json()['key']}")
+                new_issue_key = response.json()['key']
+                print(f"✅ Aangemaakt: {new_issue_key}")
+
+                # Sync comments (initial bulk sync)
+                sync_comments_for_issue(config, auth, headers, remote_key, new_issue_key, dry_run)
             except requests.exceptions.RequestException as e:
                 print(f"Error creating issue for {remote_key}: {e}")
 
@@ -355,9 +638,10 @@ if __name__ == "__main__":
         print(f"🔎 Gevonden {len(remote_issues)} issues in {config['source_jira_url']}")
 
         if not args.dry_run:
-            sync_issues_to_local(config, auth, headers, remote_issues)
+            sync_issues_to_local(config, auth, headers, remote_issues, dry_run=False)
             print("✅ Synchronization completed successfully")
         else:
+            sync_issues_to_local(config, auth, headers, remote_issues, dry_run=True)
             print("✅ Dry run completed successfully")
     except KeyboardInterrupt:
         print("\n⚠️ Process interrupted by user")
